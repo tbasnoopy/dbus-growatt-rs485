@@ -7,23 +7,23 @@ import logging.handlers
 import sys
 import os
 import sys
-import json
+
 if sys.version_info.major == 2:
     import gobject
 else:
     from gi.repository import GLib as gobject
 import sys
 import time
-import requests # for http GET
 import configparser # for config/ini file
 
 # our own packages from victron
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python'))
 from vedbus import VeDbusService
+import utils
 
 
-class DbusGrowattShineXService:
-  def __init__(self, servicename, paths, productname='Growatt ShineX', connection='Growatt ShineX HTTP Json Connection'):
+class DbusGrowattRS485Service:
+  def __init__(self, servicename, paths, productname='Growatt RS485', connection='Growatt RS485 Connection'):
     config = self._getConfig()
     deviceinstance = int(config['DEFAULT']['Deviceinstance'])
     customname = config['DEFAULT']['CustomName']
@@ -49,9 +49,9 @@ class DbusGrowattShineXService:
     self._dbusservice.add_path('/Connected', 1)
     self._dbusservice.add_path('/Role', 'pvinverter')
     self._dbusservice.add_path('/Position', int(config['DEFAULT']['Position'])) # normaly only needed for pvinverter
-    self._dbusservice.add_path('/Serial', self._getShineXSerial())
+    self._dbusservice.add_path('/Serial', self._getShineXSerial()) # todo
     self._dbusservice.add_path('/UpdateIndex', 0)
-    self._dbusservice.add_path('/StatusCode', 7)
+    self._dbusservice.add_path('/StatusCode', 7) # todo
 
     # add path values to dbus
     for path, settings in self._paths.items():
@@ -62,25 +62,15 @@ class DbusGrowattShineXService:
     self._lastUpdate = 0
 
     # add _update function 'timer'
-    gobject.timeout_add(2000, self._update) # pause 1000ms before the next request
+    gobject.timeout_add(1000, self._update) # pause 1000ms before the next request
 
-    # add _signOfLife 'timer' to get feedback in log every 5minutes
+    # add _signOfLife 'timer' to get feedback in log every 5 minutes
     gobject.timeout_add(self._getSignOfLifeInterval()*60*1000, self._signOfLife)
-
-  def _getShineXSerial(self):
-    meter_data = self._getShineXData()
-    try:
-      serial = meter_data['Mac']
-    except:
-      serial = '00:00:00:00:00:00'
-    return serial.replace(':','')
-
 
   def _getConfig(self):
     config = configparser.ConfigParser()
     config.read("%s/config.ini" % (os.path.dirname(os.path.realpath(__file__))))
-    return config;
-
+    return config
 
   def _getSignOfLifeInterval(self):
     config = self._getConfig()
@@ -91,51 +81,6 @@ class DbusGrowattShineXService:
 
     return int(value)
 
-
-  def _getShineXStatusUrl(self):
-    config = self._getConfig()
-    accessType = config['DEFAULT']['AccessType']
-
-    if accessType == 'OnPremise':
-        URL = "http://%s:%s@%s/status" % (config['ONPREMISE']['Username'], config['ONPREMISE']['Password'], config['ONPREMISE']['Host'])
-        URL = URL.replace(":@", "")
-    else:
-        raise ValueError("AccessType %s is not supported" % (config['DEFAULT']['AccessType']))
-
-    return URL
-
-
-  def _getShineXData(self):
-    URL = self._getShineXStatusUrl()
-    headers={}
-    headers['Content-Type'] = 'application/json'
-
-    meter_data = {"InverterStatus":0}
-
-    try:
-      meter_r = requests.get(url = URL, timeout=10,headers=headers)
-      if ( meter_r.status_code == 200 and meter_r.headers.get('Content-Type').startswith('text/html')):
-        REBOOT_URL = URL.replace('/status','/restart')
-        resp = requests.get(url = REBOOT_URL, timeout = 10)
-        logging.info("Reboot triggered")
-    except requests.exceptions.Timeout:
-      logging.info("RequestTimeout")
-    except requests.exceptions.TooManyRedirects:
-      print("Too Many Redirects")
-    except requests.exceptions.RequestException as e:
-      logging.info("No response from Shine X - %s" % (URL))
-      print(e)
-    except:
-      logging.info("No response from Shine X - %s" % (URL))
-
-    try:
-      meter_data = meter_r.json()
-    except:
-        logging.info("Got no Json. meter_data set to: %s" % (meter_data))
-
-    return meter_data
-
-
   def _signOfLife(self):
     logging.info("--- Start: sign of life ---")
     logging.info("Last _update() call: %s" % (self._lastUpdate))
@@ -143,6 +88,71 @@ class DbusGrowattShineXService:
     logging.info("Last '/Ac/Energy/Forward': %s" % (self._dbusservice['/Ac/Energy/Forward']))
     logging.info("--- End: sign of life ---")
     return True
+
+  def _getRS485Serial(self):
+    serial = '00:00:00:00:01:23' # todo
+    return serial.replace(':','')
+
+  def _getRS485Data(self):
+    data = read_serial_data(
+          command,
+          self.port,
+          9600,
+          self.LENGTH_POS,
+          self.LENGTH_CHECK,
+          None,
+          self.LENGTH_SIZE,
+    )
+    if data is False:
+        return False
+
+    start, length = unpack_from(">HH", data)
+    end, crc_hi, crc_lo = unpack_from(">BHH", data[-5:])
+
+    s = sum(data[0:-4])
+
+    logging.info("bytearray: " + utils.bytearray_to_string(data))
+
+    if start == 0x4E57 and end == 0x68 and s == crc_lo:
+        return data[10 : length - 7]
+    elif s != crc_lo:
+        logging.error(
+            "CRC checksum mismatch: Expected 0x%04x, Got 0x%04x" % (crc_lo, s)
+        )
+        return False
+    else:
+        logging.error(">>> ERROR: Incorrect Reply ")
+        return False
+
+
+
+    # meter_data = {"InverterStatus":0}
+
+    # try:
+    #   meter_r = requests.get(url = URL, timeout=10,headers=headers)
+    #   if ( meter_r.status_code == 200 and meter_r.headers.get('Content-Type').startswith('text/html')):
+    #     REBOOT_URL = URL.replace('/status','/restart')
+    #     resp = requests.get(url = REBOOT_URL, timeout = 10)
+    #     logging.info("Reboot triggered")
+    # except requests.exceptions.Timeout:
+    #   logging.info("RequestTimeout")
+    # except requests.exceptions.TooManyRedirects:
+    #   print("Too Many Redirects")
+    # except requests.exceptions.RequestException as e:
+    #   logging.info("No response from Shine X - %s" % (URL))
+    #   print(e)
+    # except:
+    #   logging.info("No response from Shine X - %s" % (URL))
+
+    # try:
+    #   meter_data = meter_r.json()
+    # except:
+    #     logging.info("Got no Json. meter_data set to: %s" % (meter_data))
+
+    # return meter_data
+
+
+
 
   def _update(self):
     try:
@@ -154,9 +164,9 @@ class DbusGrowattShineXService:
       cosphi = 1
 
       #send data to DBus
-      meter_data = self._getShineXData()
+      meter_data = self._getRS485Data()
       if meter_data is False:
-        logging.info("Did not got valid Json.")
+        logging.info("Did not got valid Data.")
         return True
 
       self._dbusservice['/Connected'] = meter_data['InverterStatus']
@@ -265,7 +275,7 @@ def main():
       _v = lambda p, v: (str(round(v, 1)) + 'V')
 
       #start our main-service
-      pvac_output = DbusGrowattShineXService(
+      pvac_output = DbusGrowattRS485Service(
         servicename='com.victronenergy.pvinverter',
         paths={
             '/ErrorCode': {'initial': None, 'textformat': '' },
